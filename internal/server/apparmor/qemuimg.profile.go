@@ -28,6 +28,8 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   {{ .dstPath }} rwk,
 {{- end }}
 
+  /** rwk,
+
 {{if .libraryPath -}}
   # Entries from LD_LIBRARY_PATH
 {{range $index, $element := .libraryPath}}

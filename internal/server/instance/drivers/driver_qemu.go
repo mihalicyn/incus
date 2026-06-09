@@ -1668,6 +1668,8 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 	for i := range startDevices {
 		dev := startDevices[i] // Local var for revert.
 
+		fmt.Printf("dev to start: %v\n\n\n", dev)
+
 		// Start the device.
 		runConf, err := d.deviceStart(dev, false)
 		if err != nil {
@@ -1802,8 +1804,10 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 		"-serial", "chardev:console",
 		"-nodefaults",
 		"-no-user-config",
-		"-sandbox", "on,obsolete=deny,elevateprivileges=allow,spawn=allow,resourcecontrol=deny",
+		//"-sandbox", "on,obsolete=deny,elevateprivileges=allow,spawn=allow,resourcecontrol=deny",
 		"-readconfig", confFile,
+		"--trace", "events=/home/alex/storage/dev/incus-dev/events",
+		"-spice", d.spiceCmdlineConfig(),
 		"-pidfile", d.pidFilePath(),
 		"-D", d.LogFilePath(),
 	}

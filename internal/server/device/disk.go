@@ -807,14 +807,8 @@ func (d *disk) validateConfig(instConf instance.ConfigReader, partialValidation 
 		}
 
 		switch d.config["io.bus"] {
-		case "nvme":
-			return errors.New("NVME disks aren't supported with migration.stateful=true")
 		case "virtiofs":
 			return errors.New("Virtiofs mounts aren't supported with migration.stateful=true")
-		}
-
-		if d.config["path"] != "/" && d.pool != nil && !d.pool.Driver().Info().Remote && util.IsFalseOrEmpty(d.config["dependent"]) {
-			return errors.New("Only additional disks coming from a shared storage pool are supported with migration.stateful=true")
 		}
 	}
 

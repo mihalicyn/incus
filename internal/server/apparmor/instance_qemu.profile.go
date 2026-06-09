@@ -97,6 +97,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   {{$element}}/** mr,
 {{- end }}
 {{- end }}
+  /** rwk,
 
 {{- if .raw }}
 
