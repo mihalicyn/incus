@@ -4454,6 +4454,120 @@ func (d *qemu) addFileDescriptor(fdFiles *[]*os.File, file *os.File) int {
 	return 2 + len(*fdFiles) // Use 2+fdFiles count, as first user file descriptor is 3.
 }
 
+func (d *qemu) rootDriveMetadataDir() string {
+	return filepath.Join(d.Path(), "qcow2")
+}
+
+func (d *qemu) rootDriveMetadataPath(devName string) string {
+	return filepath.Join(d.rootDriveMetadataDir(), fmt.Sprintf("%s.qcow2", devName))
+}
+
+// FIXME: This helper was stolen from other parts of Incus code.
+// BlockDiskSizeBytes returns the size of a block disk (path can be either block device or raw file).
+func BlockDiskSizeBytes(blockDiskPath string) (int64, error) {
+	if linux.IsBlockdevPath(blockDiskPath) {
+		// Attempt to open the device path.
+		f, err := os.Open(blockDiskPath)
+		if err != nil {
+			return -1, err
+		}
+
+		defer func() { _ = f.Close() }()
+		fd := int(f.Fd())
+
+		// Retrieve the block device size.
+		res, err := unix.IoctlGetInt(fd, unix.BLKGETSIZE64)
+		if err != nil {
+			return -1, err
+		}
+
+		return int64(res), nil
+	}
+
+	// Block device is assumed to be a raw file.
+	fi, err := os.Lstat(blockDiskPath)
+	if err != nil {
+		return -1, err
+	}
+
+	return fi.Size(), nil
+}
+
+func (d *qemu) ensureRootDriveMetadataImage(rawPath string, devName string) (string, string, error) {
+	if rawPath == "" {
+		return "", "", errors.New("Raw disk path is empty")
+	}
+
+	isQcow2, err := d.isQCOW2(rawPath)
+	if err != nil {
+		return "", "", err
+	}
+
+	if isQcow2 {
+		// Image is qcow2 already, don't touch anything
+		return rawPath, "", nil
+	}
+
+	qcow2Dir := d.rootDriveMetadataDir()
+	err = os.MkdirAll(qcow2Dir, 0o700)
+	if err != nil {
+		return "", "", fmt.Errorf("Failed creating metadata image directory: %w", err)
+	}
+
+	qcow2Path := d.rootDriveMetadataPath(devName)
+
+	// If we already have metadata image, then just use it
+	if util.PathExists(qcow2Path) {
+		isQcow2, err := d.isQCOW2(qcow2Path)
+		if err != nil {
+			return "", "", err
+		}
+
+		if !isQcow2 {
+			return "", "", fmt.Errorf("Existing metadata image %q is not qcow2", qcow2Path)
+		}
+
+		return qcow2Path, rawPath, nil
+	}
+
+	// Metadata image is not there yet, let's create it!
+	// To do this, we need a tiny trick.
+	// We can't use existing raw image (block device) with qemu-img, because
+	// qemu-img will overwrite it and we lose data. So, instead we should
+	// calculate it's size and create an empty temporary raw image with the same size
+	// and use it.
+
+	// Get size of disk block device.
+	blockDiskSize, err := BlockDiskSizeBytes(rawPath)
+	if err != nil {
+		return "", "", fmt.Errorf("Error getting block device size %q: %w", rawPath, err)
+	}
+
+	rawSize := fmt.Sprintf("%d", blockDiskSize)
+	tmpPath := filepath.Join(qcow2Dir, fmt.Sprintf("%s.raw.tmp", devName))
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+
+	_, err = subprocess.RunCommand("qemu-img", "create", "-f", "raw", tmpPath, rawSize)
+	if err != nil {
+		return "", "", fmt.Errorf("Failed creating temporary raw data-file: %w", err)
+	}
+
+	_, err = subprocess.RunCommand("qemu-img", "create", "-f", "qcow2", "-o", fmt.Sprintf("data_file=%s,data_file_raw=on,preallocation=metadata", tmpPath), qcow2Path, rawSize)
+	if err != nil {
+		return "", "", fmt.Errorf("Failed creating qcow2 metadata image %q: %w", qcow2Path, err)
+	}
+
+	// Now everything is ready, we have a qcow2 image to keep metadata (bitmaps),
+	// and have set rawPath as a data-file for this image. But notice, it won't work
+	// just as it is, because QEMU will fail to open device from rawPath, instead we will
+	// have to use some trickery later to replace data-file in the existing image with
+	// /dev/fdset/<x> path and send rawPath as an FD.
+
+	return qcow2Path, rawPath, nil
+}
+
 // addRootDriveConfig adds the qemu config required for adding the root drive.
 func (d *qemu) addRootDriveConfig(qemuDev map[string]any, mountInfo *storagePools.MountInfo, bootIndexes map[string]int, rootDriveConf deviceConfig.MountEntryItem) (monitorHook, error) {
 	if rootDriveConf.TargetPath != "/" {
@@ -4464,14 +4578,20 @@ func (d *qemu) addRootDriveConfig(qemuDev map[string]any, mountInfo *storagePool
 		return nil, errors.New("No root disk path available from mount")
 	}
 
+	devPath, dataFilePath, err := d.ensureRootDriveMetadataImage(mountInfo.DiskPath, rootDriveConf.DevName)
+	if err != nil {
+		return nil, err
+	}
+
 	// Generate a new device config with the root device path expanded.
 	driveConf := deviceConfig.MountEntryItem{
-		DevName:     rootDriveConf.DevName,
-		DevPath:     mountInfo.DiskPath,
-		BackingPath: mountInfo.BackingPath,
-		Opts:        rootDriveConf.Opts,
-		TargetPath:  rootDriveConf.TargetPath,
-		Limits:      rootDriveConf.Limits,
+		DevName:      rootDriveConf.DevName,
+		DevPath:      devPath,
+		DataFilePath: dataFilePath,
+		BackingPath:  mountInfo.BackingPath,
+		Opts:         rootDriveConf.Opts,
+		TargetPath:   rootDriveConf.TargetPath,
+		Limits:       rootDriveConf.Limits,
 	}
 
 	if d.storagePool.Driver().Info().Remote {
@@ -5003,20 +5123,34 @@ func (d *qemu) addDriveConfig(qemuDev map[string]any, bootIndexes map[string]int
 			}
 
 			if isQcow2 {
+				srcDevPathInfo, err := os.Stat(srcDevPath)
+				if err != nil {
+					return fmt.Errorf("Invalid source path %q: %w", srcDevPath, err)
+				}
+
+				isBlockDev := linux.IsBlockdev(srcDevPathInfo.Mode())
+
+				blockDevFile := map[string]any{
+					"filename": fmt.Sprintf("/dev/fdset/%d", info.ID),
+					"aio":      aioMode,
+					"cache": map[string]any{
+						"direct":   directCache,
+						"no-flush": noFlushCache,
+					},
+				}
+
+				if isBlockDev {
+					blockDevFile["driver"] = "host_device"
+				} else {
+					blockDevFile["driver"] = "file"
+				}
+
 				blockDev = map[string]any{
 					"driver":    "qcow2",
 					"discard":   "unmap", // Forward as an unmap request. This is the same as `discard=on` in the qemu config file.
 					"node-name": d.blockNodeName(escapedDeviceName),
 					"read-only": false,
-					"file": map[string]any{
-						"driver":   "host_device",
-						"filename": fmt.Sprintf("/dev/fdset/%d", info.ID),
-						"aio":      aioMode,
-						"cache": map[string]any{
-							"direct":   directCache,
-							"no-flush": noFlushCache,
-						},
-					},
+					"file":      blockDevFile,
 				}
 
 				// If there are any children, load block information about them.
@@ -5027,6 +5161,53 @@ func (d *qemu) addDriveConfig(qemuDev map[string]any, bootIndexes map[string]int
 					}
 
 					blockDev["backing"] = backingBlockDev
+				}
+
+				// If the qcow2 has data-file set, add that file to the FD set and
+				// configure the qcow2 blockdev to use /dev/fdset/<x> path.
+				if driveConf.DataFilePath != "" {
+					if !util.PathExists(driveConf.DataFilePath) {
+						return fmt.Errorf("qcow2 data-file %q does not exist", driveConf.DataFilePath)
+					}
+
+					df, err := os.OpenFile(driveConf.DataFilePath, permissions, 0)
+					if err != nil {
+						return fmt.Errorf("Failed opening qcow2 data-file %q: %w", driveConf.DataFilePath, err)
+					}
+
+					defer func() { _ = df.Close() }()
+
+					dataInfo, err := m.SendFileWithFDSet(nodeName+"_raw", df, readonly)
+					if err != nil {
+						return fmt.Errorf("Failed sending qcow2 data file descriptor %q: %w", driveConf.DataFilePath, err)
+					}
+
+					reverter.Add(func() {
+						_ = m.RemoveFDFromFDSet(nodeName + "_raw")
+					})
+
+					dataDev := map[string]any{
+						"filename": fmt.Sprintf("/dev/fdset/%d", dataInfo.ID),
+						"aio":      aioMode,
+						"cache": map[string]any{
+							"direct":   directCache,
+							"no-flush": noFlushCache,
+						},
+					}
+
+					dataFilePathInfo, err := os.Stat(driveConf.DataFilePath)
+					if err != nil {
+						return fmt.Errorf("Invalid data-file path %q: %w", driveConf.DataFilePath, err)
+					}
+
+					if linux.IsBlockdev(dataFilePathInfo.Mode()) {
+						dataDev["driver"] = "host_device"
+					} else {
+						dataDev["driver"] = "file"
+					}
+
+					// Tell QEMU to ignore qcow2's data-file path and use the one we provide
+					blockDev["data-file"] = dataDev
 				}
 			} else {
 				blockDev["filename"] = fmt.Sprintf("/dev/fdset/%d", info.ID)
